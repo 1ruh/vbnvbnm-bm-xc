@@ -1,29 +1,31 @@
 from flask import Flask, request, jsonify
-import json
 import os
 import secrets
 import string
+import json
 from datetime import datetime, timedelta
+import redis
 
 app = Flask(__name__)
-KEYS_FILE = "keys.json"
 
-# Set your admin password via Render Environment Variables as ADMIN_PASSWORD
+# Render automatically sets REDIS_URL when you link a Redis instance
+REDIS_URL     = os.environ.get("REDIS_URL", "redis://localhost:6379")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin9001")
 
-def load_keys():
-    if os.path.exists(KEYS_FILE):
-        with open(KEYS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+r = redis.from_url(REDIS_URL, decode_responses=True)
 
-def save_keys(keys):
-    with open(KEYS_FILE, 'w') as f:
-        json.dump(keys, f, indent=4)
+def get_key(key: str):
+    data = r.get(f"key:{key}")
+    return json.loads(data) if data else None
+
+def set_key(key: str, data: dict):
+    r.set(f"key:{key}", json.dumps(data))
 
 def generate_key_string():
     alphabet = string.ascii_uppercase + string.digits
     return '-'.join(''.join(secrets.choice(alphabet) for _ in range(4)) for _ in range(6))
+
+# ── ROUTES ────────────────────────────────────────────────────
 
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -31,46 +33,56 @@ def ping():
 
 @app.route('/validate', methods=['POST'])
 def validate_key():
-    data = request.json
-    key = data.get('key')
-    hwid = data.get('hwid')
-    
-    keys = load_keys()
-    
-    if key not in keys:
+    data = request.json or {}
+    key  = data.get('key',  '').strip()
+    hwid = data.get('hwid', '').strip()
+
+    if not key or not hwid:
+        return jsonify({"success": False, "message": "Invalid request"})
+
+    entry = get_key(key)
+    if not entry:
         return jsonify({"success": False, "message": "Invalid key"})
-        
-    key_data = keys[key]
-    
-    if key_data.get('status') == 'banned':
+
+    if entry.get('status') == 'banned':
         return jsonify({"success": False, "message": "This key has been banned"})
 
-    if key_data['status'] == 'unused':
-        key_data['status'] = 'active'
-        key_data['hwid'] = hwid
-        key_data['activation_date'] = datetime.now().isoformat()
-        save_keys(keys)
-        return jsonify({"success": True, "message": f"Key activated! Type: {key_data['type']}"})
+    # First-time activation
+    if entry['status'] == 'unused':
+        entry.update({
+            "status": "active",
+            "hwid": hwid,
+            "activation_date": datetime.utcnow().isoformat()
+        })
+        set_key(key, entry)
+        return jsonify({
+            "success": True, 
+            "message": f"Key activated! Type: {entry['type']}",
+            "spoof_type": entry.get('spoof_type', 'temp')
+        })
 
-    if key_data['status'] == 'active':
-        if key_data['hwid'] != hwid:
+    # Already active
+    if entry['status'] == 'active':
+        if entry.get('hwid') != hwid:
             return jsonify({"success": False, "message": "HWID mismatch. Contact support."})
 
-        if key_data['type'] != 'lifetime':
-            activation_date = datetime.fromisoformat(key_data['activation_date'])
-            days_allowed = 7 if key_data['type'] == '7d' else 30
-            expiration_date = activation_date + timedelta(days=days_allowed)
-            
-            if datetime.now() > expiration_date:
-                key_data['status'] = 'expired'
-                save_keys(keys)
+        if entry['type'] != 'lifetime':
+            activation_date = datetime.fromisoformat(entry['activation_date'])
+            days_allowed = 7 if entry['type'] == '7d' else 30
+            if datetime.utcnow() > activation_date + timedelta(days=days_allowed):
+                entry['status'] = 'expired'
+                set_key(key, entry)
                 return jsonify({"success": False, "message": "Key has expired"})
 
-        return jsonify({"success": True, "message": "Login successful"})
+        return jsonify({
+            "success": True, 
+            "message": "Login successful",
+            "spoof_type": entry.get('spoof_type', 'temp')
+        })
 
     return jsonify({"success": False, "message": "Key is no longer valid"})
 
-# ── ADMIN ENDPOINTS ──────────────────────────────────────────
+# ── ADMIN ENDPOINTS ───────────────────────────────────────────
 
 @app.route('/admin/genkey', methods=['POST'])
 def admin_genkey():
@@ -78,27 +90,31 @@ def admin_genkey():
     if data.get('password') != ADMIN_PASSWORD:
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
-    key_type = data.get('type', 'lifetime')  # 7d, 30d, lifetime
+    key_type = data.get('type', 'lifetime')
     if key_type not in ('7d', '30d', 'lifetime'):
         return jsonify({"success": False, "message": "Invalid type. Use 7d, 30d or lifetime"}), 400
 
-    count = int(data.get('count', 1))
-    note = data.get('note', '')
-    keys = load_keys()
+    spoof_type = data.get('spoof_type', 'temp')
+    if spoof_type not in ('temp', 'perm', 'both'):
+        return jsonify({"success": False, "message": "Invalid spoof_type. Use temp, perm, or both"}), 400
+
+    count     = int(data.get('count', 1))
+    note      = data.get('note', '')
     generated = []
 
     for _ in range(count):
         new_key = generate_key_string()
-        keys[new_key] = {
+        set_key(new_key, {
             "type": key_type,
+            "spoof_type": spoof_type,
             "note": note,
             "hwid": None,
             "status": "unused",
-            "activation_date": None
-        }
+            "activation_date": None,
+            "created_at": datetime.utcnow().isoformat()
+        })
         generated.append(new_key)
 
-    save_keys(keys)
     return jsonify({"success": True, "keys": generated})
 
 @app.route('/admin/listkeys', methods=['POST'])
@@ -107,8 +123,12 @@ def admin_listkeys():
     if data.get('password') != ADMIN_PASSWORD:
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
-    keys = load_keys()
-    return jsonify({"success": True, "keys": keys})
+    all_keys = r.keys("key:*")
+    result = {}
+    for k in all_keys:
+        clean = k.replace("key:", "", 1)
+        result[clean] = json.loads(r.get(k))
+    return jsonify({"success": True, "keys": result})
 
 @app.route('/admin/bankey', methods=['POST'])
 def admin_bankey():
@@ -116,14 +136,29 @@ def admin_bankey():
     if data.get('password') != ADMIN_PASSWORD:
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
-    key = data.get('key')
-    keys = load_keys()
-    if key not in keys:
+    key = data.get('key', '').strip()
+    entry = get_key(key)
+    if not entry:
         return jsonify({"success": False, "message": "Key not found"}), 404
 
-    keys[key]['status'] = 'banned'
-    save_keys(keys)
+    entry['status'] = 'banned'
+    set_key(key, entry)
     return jsonify({"success": True, "message": f"Key {key} has been banned"})
+
+@app.route('/admin/resetkey', methods=['POST'])
+def admin_resetkey():
+    data = request.json or {}
+    if data.get('password') != ADMIN_PASSWORD:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+
+    key = data.get('key', '').strip()
+    entry = get_key(key)
+    if not entry:
+        return jsonify({"success": False, "message": "Key not found"}), 404
+
+    entry.update({"status": "unused", "hwid": None, "activation_date": None})
+    set_key(key, entry)
+    return jsonify({"success": True, "message": f"Key {key} HWID reset"})
 
 if __name__ == "__main__":
     app.run(port=5000)
