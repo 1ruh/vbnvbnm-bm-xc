@@ -9,7 +9,7 @@ app = Flask(__name__)
 KEYS_FILE = "keys.json"
 
 # Set your admin password via Render Environment Variables as ADMIN_PASSWORD
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme123")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin9001")
 
 def load_keys():
     if os.path.exists(KEYS_FILE):
@@ -24,6 +24,10 @@ def save_keys(keys):
 def generate_key_string():
     alphabet = string.ascii_uppercase + string.digits
     return '-'.join(''.join(secrets.choice(alphabet) for _ in range(4)) for _ in range(6))
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "online"})
 
 @app.route('/validate', methods=['POST'])
 def validate_key():
